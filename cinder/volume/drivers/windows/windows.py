@@ -29,6 +29,7 @@ from oslo.config import cfg
 from cinder import exception
 from cinder.openstack.common import log as logging
 from cinder.volume import driver
+from cinder.volume.drivers.windows import windows_common
 
 # Check needed for unit testing on Unix
 if os.name == 'nt':
@@ -52,25 +53,12 @@ class WindowsDriver(driver.ISCSIDriver):
 
     def __init__(self, *args, **kwargs):
         super(WindowsDriver, self).__init__(*args, **kwargs)
-
-    def do_setup(self, context):
-        """Setup the Windows Volume driver.
-
-        Called one time by the manager after the driver is loaded.
-        Validate the flags we care about
-        """
-        #Set the flags
-        self._conn_wmi = wmi.WMI(moniker='//./root/wmi')
-        self._conn_cimv2 = wmi.WMI(moniker='//./root/cimv2')
+        self.common = windows_common.WindowsCommon()
 
     def check_for_setup_error(self):
         """Check that the driver is working and can communicate.
         """
-        #Invoking the portal an checking that is listening
-        wt_portal = self._conn_wmi.WT_Portal()[0]
-        listen = wt_portal.Listen
-        if not listen:
-            raise exception.VolumeBackendAPIException()
+        self.common.check_for_setup_error()
 
     def initialize_connection(self, volume, connector):
         """Driver entry point to attach a volume to an instance.
@@ -78,33 +66,10 @@ class WindowsDriver(driver.ISCSIDriver):
         initiator_name = connector['initiator']
         target_name = volume['provider_location']
 
-        cl = self._conn_wmi.__getattr__("WT_IDMethod")
-        wt_idmethod = cl.new()
-        wt_idmethod.HostName = target_name
-        wt_idmethod.Method = 4
-        wt_idmethod.Value = initiator_name
-        wt_idmethod.put()
-        #Getting the portal and port information
-        wt_portal = self._conn_wmi.WT_Portal()[0]
-        (address, port) = (wt_portal.Address, wt_portal.Port)
-        #Getting the host information
-        hosts = self._conn_wmi.WT_Host(Hostname=target_name)
-        host = hosts[0]
+        self.common.associate_initiator_with_iscsi_target(target_name,
+                                                          initiator_name)
 
-        properties = {}
-        properties['target_discovered'] = False
-        properties['target_portal'] = '%s:%s' % (address, port)
-        properties['target_iqn'] = host.TargetIQN
-        properties['target_lun'] = 0
-        properties['volume_id'] = volume['id']
-
-        auth = volume['provider_auth']
-        if auth:
-            (auth_method, auth_username, auth_secret) = auth.split()
-
-            properties['auth_method'] = auth_method
-            properties['auth_username'] = auth_username
-            properties['auth_password'] = auth_secret
+        properties = self.common.get_host_information(volume, target_name)
 
         return {
             'driver_volume_type': 'iscsi',
@@ -114,28 +79,22 @@ class WindowsDriver(driver.ISCSIDriver):
     def terminate_connection(self, volume, connector, **kwargs):
         """Driver entry point to unattach a volume from an instance.
 
-        Unmask the LUN on the storage system so the given intiator can no
+        Unmask the LUN on the storage system so the given initiator can no
         longer access it.
         """
         initiator_name = connector['initiator']
-        provider_location = volume['provider_location']
-        #DesAssigning target to initiators
-        wt_idmethod = self._conn_wmi.WT_IDMethod(HostName=provider_location,
-                                                 Method=4,
-                                                 Value=initiator_name)[0]
-        wt_idmethod.Delete_()
+        target_name = volume['provider_location']
+        self.common.delete_iscsi_target(initiator_name, target_name)
 
     def create_volume(self, volume):
         """Driver entry point for creating a new volume."""
-        vhd_path = self._get_vhd_path(volume)
+        vhd_path = self.local_path(volume)
         vol_name = volume['name']
-        #The WMI procedure returns a Generic failure
-        cl = self._conn_wmi.__getattr__("WT_Disk")
-        cl.NewWTDisk(DevicePath=vhd_path,
-                     Description=vol_name,
-                     SizeInMB=volume['size'] * 1024)
+        vol_size = volume['size']
 
-    def _get_vhd_path(self, volume):
+        self.common.create_volume(vhd_path, vol_name, vol_size)
+
+    def local_path(self, volume):
         base_vhd_folder = CONF.windows_iscsi_lun_path
         if not os.path.exists(base_vhd_folder):
                 LOG.debug(_('Creating folder %s '), base_vhd_folder)
@@ -145,13 +104,9 @@ class WindowsDriver(driver.ISCSIDriver):
     def delete_volume(self, volume):
         """Driver entry point for destroying existing volumes."""
         vol_name = volume['name']
-        wt_disk = self._conn_wmi.WT_Disk(Description=vol_name)[0]
-        wt_disk.Delete_()
-        vhdfiles = self._conn_cimv2.query(
-            "Select * from CIM_DataFile where Name = '" +
-            self._get_vhd_path(volume) + "'")
-        if len(vhdfiles) > 0:
-            vhdfiles[0].Delete()
+        vhd_path = self.local_path(volume)
+
+        self.common.delete_volume(vol_name, vhd_path)
 
     def create_snapshot(self, snapshot):
         """Driver entry point for creating a snapshot.
@@ -160,30 +115,18 @@ class WindowsDriver(driver.ISCSIDriver):
         vol_name = snapshot['volume_name']
         snapshot_name = snapshot['name']
 
-        wt_disk = self._conn_wmi.WT_Disk(Description=vol_name)[0]
-        #API Calls gets Generic Failure
-        cl = self._conn_wmi.__getattr__("WT_Snapshot")
-        disk_id = wt_disk.WTD
-        out = cl.Create(WTD=disk_id)
-        #Setting description since it used as a KEY
-        wt_snapshot_created = self._conn_wmi.WT_Snapshot(Id=out[0])[0]
-        wt_snapshot_created.Description = snapshot_name
-        wt_snapshot_created.put()
+        self.common.create_snapshot(vol_name, snapshot_name)
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Driver entry point for exporting snapshots as volumes."""
         snapshot_name = snapshot['name']
-        wt_snapshot = self._conn_wmi.WT_Snapshot(Description=snapshot_name)[0]
-        disk_id = wt_snapshot.Export()[0]
-        wt_disk = self._conn_wmi.WT_Disk(WTD=disk_id)[0]
-        wt_disk.Description = volume['name']
-        wt_disk.put()
+        vol_name = volume['name']
+        self.common.create_volume_from_snapshot(vol_name, snapshot_name)
 
     def delete_snapshot(self, snapshot):
         """Driver entry point for deleting a snapshot."""
         snapshot_name = snapshot['name']
-        wt_snapshot = self._conn_wmi.WT_Snapshot(Description=snapshot_name)[0]
-        wt_snapshot.Delete_()
+        self.common.delete_snapshot(snapshot_name)
 
     def _do_export(self, _ctx, volume, ensure=False):
         """Do all steps to get disk exported as LUN 0 at separate target.
@@ -194,26 +137,11 @@ class WindowsDriver(driver.ISCSIDriver):
         :return: iscsiadm-formatted provider location string
         """
         target_name = "%s%s" % (CONF.iscsi_target_prefix, volume['name'])
-        #ISCSI target creation
-        try:
-            cl = self._conn_wmi.__getattr__("WT_Host")
-            cl.NewHost(HostName=target_name)
-        except Exception as exc:
-            excep_info = exc.com_error.excepinfo[2]
-            if not ensure or excep_info.find(u'The file exists') == -1:
-                raise
-            else:
-                LOG.info(_('Ignored target creation error "%s"'
-                           ' while ensuring export'), exc)
+        self.common.create_iscsi_target(target_name, ensure)
+
         #Get the disk to add
         vol_name = volume['name']
-        q = self._conn_wmi.WT_Disk(Description=vol_name)
-        if not len(q):
-            LOG.debug(_('Disk not found: %s'), vol_name)
-            return None
-        wt_disk = q[0]
-        wt_host = self._conn_wmi.WT_Host(HostName=target_name)[0]
-        wt_host.AddWTDisk(wt_disk.WTD)
+        self.common.add_disk_to_target(vol_name, target_name)
 
         return target_name
 
@@ -231,15 +159,27 @@ class WindowsDriver(driver.ISCSIDriver):
         """
         target_name = "%s%s" % (CONF.iscsi_target_prefix, volume['name'])
 
-        #Get ISCSI target
-        wt_host = self._conn_wmi.WT_Host(HostName=target_name)[0]
-        wt_host.RemoveAllWTDisks()
-        wt_host.Delete_()
+        self.common.remove_iscsi_target(target_name)
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
         """Fetch the image from image_service and write it to the volume."""
-        raise NotImplementedError()
+        #Convert to VHD and file back to VHD
+        self.common.fetch_to_vhd(context, image_service, image_id,
+                                 self.local_path(volume))
 
     def copy_volume_to_image(self, context, volume, image_service, image_meta):
         """Copy the volume to the specified image."""
+        #Convert to image destination
+        self.common.upload_volume(context,
+                                  image_service,
+                                  image_meta,
+                                  self.local_path(volume))
+
+    def create_cloned_volume(self, volume, src_vref):
+        """Creates a clone of the specified volume."""
+        #Create a new volume
+        #Copy VHD file of the volume to clone to the created volume
+        self.create_volume(volume)
+        self.common.copy_volume(self.local_path(src_vref),
+                                self.local_path(volume))
         raise NotImplementedError()
