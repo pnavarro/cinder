@@ -654,7 +654,6 @@ class NfsDriverTestCase(test.TestCase):
 
         volume = DumbVolume()
         volume['name'] = 'volume-123'
-        volume['provider_location'] = self.TEST_NFS_EXPORT1
 
         mox.StubOutWithMock(drv, 'local_path')
         drv.local_path(volume).AndReturn(self.TEST_LOCAL_PATH)

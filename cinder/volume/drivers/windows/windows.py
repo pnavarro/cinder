@@ -35,7 +35,7 @@ from cinder.volume.drivers.windows import windows_common
 if os.name == 'nt':
     import wmi
 
-
+VERSION = '1.0'
 LOG = logging.getLogger(__name__)
 
 windows_opts = [
@@ -155,7 +155,7 @@ class WindowsDriver(driver.ISCSIDriver):
         return {'provider_location': loc}
 
     def remove_export(self, context, volume):
-        """Driver exntry point to remove an export for a volume.
+        """Driver entry point to remove an export for a volume.
         """
         target_name = "%s%s" % (CONF.iscsi_target_prefix, volume['name'])
 
@@ -180,6 +180,31 @@ class WindowsDriver(driver.ISCSIDriver):
         #Create a new volume
         #Copy VHD file of the volume to clone to the created volume
         self.create_volume(volume)
-        self.common.copy_volume(self.local_path(src_vref),
-                                self.local_path(volume))
-        raise NotImplementedError()
+        self.common.copy_vhd_disk(self.local_path(src_vref),
+                                  self.local_path(volume))
+
+    def get_volume_stats(self, refresh=False):
+        """Get volume stats.
+
+        If 'refresh' is True, run update the stats first.
+        """
+        if refresh:
+            self._update_volume_stats()
+
+        return self._stats
+
+    def _update_volume_stats(self):
+        """Retrieve stats info for Windows device."""
+
+        LOG.debug(_("Updating volume stats"))
+        data = {}
+        backend_name = self.__class__.__name__
+        if self.configuration:
+            backend_name = self.configuration.safe_get('volume_backend_name')
+        data["volume_backend_name"] = backend_name or self.__class__.__name__
+        data["vendor_name"] = 'Microsoft'
+        data["driver_version"] = VERSION
+        data["storage_protocol"] = 'iSCSI'
+
+        data['QoS_support'] = False
+        self._stats = data
