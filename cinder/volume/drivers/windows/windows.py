@@ -21,7 +21,6 @@ This driver requires ISCSI target role installed
 
 """
 
-
 import os
 
 from oslo.config import cfg
@@ -97,8 +96,8 @@ class WindowsDriver(driver.ISCSIDriver):
     def local_path(self, volume):
         base_vhd_folder = CONF.windows_iscsi_lun_path
         if not os.path.exists(base_vhd_folder):
-                LOG.debug(_('Creating folder %s '), base_vhd_folder)
-                os.makedirs(base_vhd_folder)
+            LOG.debug(_('Creating folder %s '), base_vhd_folder)
+            os.makedirs(base_vhd_folder)
         return os.path.join(base_vhd_folder, str(volume['name']) + ".vhd")
 
     def delete_volume(self, volume):
@@ -205,6 +204,23 @@ class WindowsDriver(driver.ISCSIDriver):
         data["vendor_name"] = 'Microsoft'
         data["driver_version"] = VERSION
         data["storage_protocol"] = 'iSCSI'
-
+        data['total_capacity_gb'] = 'infinite'
+        data['free_capacity_gb'] = 'infinite'
+        data['reserved_percentage'] = 100
         data['QoS_support'] = False
         self._stats = data
+
+    def extend_volume(self, volume, new_size):
+        """Extend an Existing Volume."""
+        old_size = volume['size']
+        additional_size = (new_size - old_size) * 1024
+        try:
+            self.common.extend(volume['name'], additional_size)
+        except Exception:
+            msg = _('Failed to Extend Volume '
+                    '%(volname)s') % {'volname': volume['name']}
+            LOG.error(msg)
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        LOG.debug(_("Extend volume from %(old_size) to %(new_size)"),
+                  {'old_size': old_size, 'new_size': new_size})

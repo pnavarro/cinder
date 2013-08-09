@@ -21,11 +21,11 @@ Utility class for Windows Storage Server 2012 volume related operations.
 import os
 import tempfile
 
+from eventlet.green import subprocess
 from oslo.config import cfg
 
 from cinder import exception
 from cinder.openstack.common import log as logging
-from cinder import utils
 from cinder.image import image_utils
 from cinder.openstack.common import fileutils
 
@@ -181,13 +181,11 @@ class WindowsCommon(object):
     def convert_image(self, source, dest, out_format):
         """Convert image to other format"""
         cmd = (CONF.qemu_img_cmd, 'convert', '-O', out_format, source, dest)
-        utils.execute(*cmd, run_as_root=True)
+        self._execute(*cmd)
 
     def qemu_img_info(self, path):
         """Return a object containing the parsed output from qemu-img info."""
-        out, err = utils.execute('env', 'LC_ALL=C', 'LANG=C',
-                                 CONF.qemu_img_cmd, 'info', path,
-                                 run_as_root=True)
+        out, err = self._execute(CONF.qemu_img_cmd, 'info', path)
         return image_utils.QemuImgInfo(out)
 
     def fetch_to_vhd(self, context, image_service,
@@ -198,8 +196,11 @@ class WindowsCommon(object):
             os.makedirs(CONF.image_conversion_dir)
 
         with image_utils.temporary_file() as tmp:
+            LOG.debug("Downloading image %s was to tmp dest: " ,image_id)
             image_utils.fetch(context, image_service, image_id, tmp, user_id,
                               project_id)
+
+            LOG.debug("Downloading DONE %s was to tmp dest: " ,image_id)
 
             data = self.qemu_img_info(tmp)
             fmt = data.file_format
@@ -218,15 +219,10 @@ class WindowsCommon(object):
                                  'backing_file': backing_file,
                              })
 
-            # NOTE(jdg): I'm using qemu-img convert to write
-            # to the volume regardless if it *needs* conversion or not
-            # TODO(avishay): We can speed this up by checking if the image is raw
-            # and if so, writing directly to the device. However, we need to keep
-            # check via 'qemu-img info' that what we copied was in fact a raw
-            # image and not a different format with a backing file, which may be
-            # malicious.
-            LOG.debug("%s was %s, converting to vhd" % (image_id, fmt))
-            image_utils.convert_image(tmp, dest, 'vpc')
+            if 'vpc' not in fmt:
+                self.convert_image(tmp, dest, 'vpc')
+            else:
+                self.copy_vhd_disk(tmp, dest)
 
             data = self.qemu_img_info(dest)
             if data.file_format != "vpc":
@@ -236,26 +232,29 @@ class WindowsCommon(object):
                     data.file_format)
 
     def upload_volume(self, context, image_service, image_meta, volume_path):
-
+        LOG.debug("Uploading volume %s: " ,volume_path)
         image_id = image_meta['id']
         if (image_meta['disk_format'] == 'vhd'):
             LOG.debug("%s was raw, no need to convert to %s" %
                       (image_id, image_meta['disk_format']))
-            with utils.temporary_chown(volume_path):
-                with fileutils.file_open(volume_path) as image_file:
-                    image_service.update(context, image_id, {}, image_file)
+            with fileutils.file_open(volume_path) as image_file:
+                image_service.update(context, image_id, {}, image_file)
             return
 
         if (CONF.image_conversion_dir and not
                 os.path.exists(CONF.image_conversion_dir)):
             os.makedirs(CONF.image_conversion_dir)
 
+        #Copy the volume to the image conversion dir
+        temp_vhd_path = os.path.join(CONF.image_conversion_dir, str(image_meta['id']) + ".vhd")
+        self.copy_vhd_disk(volume_path, temp_vhd_path)
+
         fd, tmp = tempfile.mkstemp(dir=CONF.image_conversion_dir)
         os.close(fd)
         with fileutils.remove_path_on_error(tmp):
-            LOG.debug("%s was raw, converting to %s" %
+            LOG.debug("%s was vhd, converting to %s" %
                       (image_id, image_meta['disk_format']))
-            self.convert_image(volume_path, tmp, image_meta['disk_format'])
+            self.convert_image(temp_vhd_path, tmp, image_meta['disk_format'])
 
             data = self.qemu_img_info(tmp)
             if data.file_format != image_meta['disk_format']:
@@ -264,8 +263,10 @@ class WindowsCommon(object):
                     reason=_("Converted to %(f1)s, but format is now %(f2)s") %
                     {'f1': image_meta['disk_format'], 'f2': data.file_format})
 
+            LOG.debug("Converted size of %s is: %s", data.backing_file, data.disk_size)
+
             with fileutils.file_open(tmp) as image_file:
-                image_service.update(context, image_id, {}, image_file)
+                image_service.update(context, image_id, image_meta, image_file)
             os.unlink(tmp)
 
     def copy_vhd_disk(self, source_path, destination_path):
@@ -275,3 +276,23 @@ class WindowsCommon(object):
             source_path + "'")
         if len(vhdfiles) > 0:
             vhdfiles[0].Copy(destination_path)
+
+    def extend(self, vol_name, additional_size):
+        """Extend an Existing Volume."""
+        q = self._conn_wmi.WT_Disk(Description=vol_name)
+        if not len(q):
+            LOG.debug(_('Disk not found: %s'), vol_name)
+            return None
+        wt_disk = q[0]
+        wt_disk.Extend(additional_size)
+
+    def _execute(self, *cmd, **kwargs):
+        _PIPE = subprocess.PIPE  # pylint: disable=E1101
+        proc = subprocess.Popen(
+            cmd,
+            stdin=_PIPE,
+            stdout=_PIPE,
+            stderr=_PIPE,
+        )
+        stdout_value, stderr_value = proc.communicate()
+        return stdout_value, stderr_value
